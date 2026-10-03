@@ -1,0 +1,9 @@
+{
+  "key.categories.fpsguard": "FPS Guard",
+  "key.fpsguard.hud": "Toggle FPS/RAM overlay",
+  "key.fpsguard.toggle": "Toggle FPS Guard",
+  "fpsguard.msg.hud_on": "FPS Guard: overlay on",
+  "fpsguard.msg.hud_off": "FPS Guard: overlay off",
+  "fpsguard.msg.guard_on": "FPS Guard: ON",
+  "fpsguard.msg.guard_off": "FPS Guard: OFF (settings restored)"
+}

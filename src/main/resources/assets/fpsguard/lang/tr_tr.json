@@ -1,0 +1,9 @@
+{
+  "key.categories.fpsguard": "FPS Guard",
+  "key.fpsguard.hud": "FPS/RAM göstergesini aç/kapat",
+  "key.fpsguard.toggle": "FPS Guard aç/kapat",
+  "fpsguard.msg.hud_on": "FPS Guard: gösterge açık",
+  "fpsguard.msg.hud_off": "FPS Guard: gösterge kapalı",
+  "fpsguard.msg.guard_on": "FPS Guard: AÇIK",
+  "fpsguard.msg.guard_off": "FPS Guard: KAPALI (ayarların geri yüklendi)"
+}
