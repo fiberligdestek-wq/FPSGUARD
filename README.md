@@ -4,17 +4,16 @@ Mesafeleri (render / simulation / entity) FPS ve RAM durumuna göre otomatik kı
 durum düzelince geri açar. Doku, shader ya da başka modun grafiğine dokunmaz.
 
 ## Ne yapar
-- Son 4 saniyenin ortalama FPS'i hedefin (varsayılan 60) altına inerse 1 kademe kısar (4 sn'de bir).
-- FPS hedefin 30 üstüne çıkarsa ve RAM rahatsa 1 kademe geri açar (20 sn'de bir).
-- Java heap %88'in üstünde 3 sn kalırsa: parçacıkları temizler + GC ister (dakikada en fazla 1).
-  GC'den sonra da yüksekse render mesafesini kısar.
-- Pencere arka plandayken FPS sınırı 10'a iner, öne gelince eski haline döner.
-- Dünyaya girince 20 sn bekler (chunk yüklenirken ayar oynamaz).
-- Sen ayarı elle değiştirirsen yeni değeri "senin ayarın" kabul eder.
+- Son N saniyenin ortalama FPS'i hedefin altına inerse mesafeleri 1 kademe kısar, hedefin üstüne çıkınca geri açar.
+- Java heap eşiği aşılırsa çöp toplama ister (aralık ayarlı); sonra da yüksekse mesafeyi kısar.
+- CPU yükü yüksek ve FPS düşükse 2 kademe birden kısar, CPU yüksekken geri açmaz.
+- Pencere arka plandayken FPS sınırını düşürür.
+- Profiller: LIGHT / BALANCED / AGGRESSIVE / CUSTOM (**F7** ile değişir).
+- Gösterge: köşe, boyut, FPS/RAM/CPU/Guard satırları ayarlanır. **F8** gösterge, **F9** Guard aç/kapat.
+- Tüm ayarlar oyun içinde: **Mods -> FPS Guard -> Config** (anında uygulanır).
 - Dünyadan çıkarken / oyun kapanırken senin orijinal ayarlarını geri yazar.
-- Sol üstte FPS / RAM göstergesi. **F8** gösterge, **F9** Guard aç/kapat.
 
-Ayarlar: `.minecraft/config/fpsguard-client.toml`
+Ayar dosyası: `.minecraft/config/fpsguard-client.toml`
 
 ## Derleme (kendi bilgisayarında, internet gerekir)
 1. JDK 21 kur (Temurin 21 önerilir).

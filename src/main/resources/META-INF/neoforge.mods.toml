@@ -4,7 +4,7 @@ license = "MIT"
 
 [[mods]]
 modId = "fpsguard"
-version = "1.0.0"
+version = "1.1.0"
 displayName = "FPS Guard"
 authors = "Emir"
 description = '''

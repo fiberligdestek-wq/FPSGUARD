@@ -1,5 +1,10 @@
 package com.fpsguard;
 
+import com.fpsguard.FpsGuardConfig.Corner;
+import com.fpsguard.FpsGuardConfig.Profile;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
@@ -16,11 +21,12 @@ import org.lwjgl.glfw.GLFW;
 public final class GuardController {
     static final KeyMapping KEY_HUD = new KeyMapping("key.fpsguard.hud", GLFW.GLFW_KEY_F8, "key.categories.fpsguard");
     static final KeyMapping KEY_GUARD = new KeyMapping("key.fpsguard.toggle", GLFW.GLFW_KEY_F9, "key.categories.fpsguard");
+    static final KeyMapping KEY_PROFILE = new KeyMapping("key.fpsguard.profile", GLFW.GLFW_KEY_F7, "key.categories.fpsguard");
 
-    private static final int WINDOW = 4;          // son 4 saniyenin ortalaması
+    private static final int SAMPLE_MAX = 10;
     private static final double ENTITY_STEP = 0.25;
 
-    private final int[] samples = new int[WINDOW];
+    private final int[] samples = new int[SAMPLE_MAX];
     private int sampleCount;
     private int sampleIdx;
 
@@ -45,12 +51,14 @@ public final class GuardController {
     private long lastGc;
     private int ramHighSeconds;
     private int ramPct;
+    private int cpuPct = -1;
 
     private Integer savedFrameLimit;
 
     public static void registerKeys(RegisterKeyMappingsEvent e) {
         e.register(KEY_HUD);
         e.register(KEY_GUARD);
+        e.register(KEY_PROFILE);
     }
 
     private boolean isGuardOn() {
@@ -71,14 +79,21 @@ public final class GuardController {
 
         while (KEY_HUD.consumeClick()) {
             hudOn = !isHudOn();
-            msg(mc, hudOn ? "fpsguard.msg.hud_on" : "fpsguard.msg.hud_off");
+            msg(mc, Component.translatable(hudOn ? "fpsguard.msg.hud_on" : "fpsguard.msg.hud_off"));
         }
         while (KEY_GUARD.consumeClick()) {
             guardOn = !isGuardOn();
             if (!guardOn) {
                 restoreAll(mc);
             }
-            msg(mc, guardOn ? "fpsguard.msg.guard_on" : "fpsguard.msg.guard_off");
+            msg(mc, Component.translatable(guardOn ? "fpsguard.msg.guard_on" : "fpsguard.msg.guard_off"));
+        }
+        while (KEY_PROFILE.consumeClick()) {
+            Profile[] all = Profile.values();
+            Profile next = all[(FpsGuardConfig.PROFILE.get().ordinal() + 1) % all.length];
+            FpsGuardConfig.PROFILE.set(next);
+            FpsGuardConfig.PROFILE.save();
+            msg(mc, Component.translatable("fpsguard.msg.profile", next.name()));
         }
 
         handleBackground(mc);
@@ -89,9 +104,10 @@ public final class GuardController {
         if (!isGuardOn() || mc.level == null || mc.player == null) return;
 
         // Saniyede bir örnek al
+        cpuPct = readCpu();
         samples[sampleIdx] = mc.getFps();
-        sampleIdx = (sampleIdx + 1) % WINDOW;
-        if (sampleCount < WINDOW) sampleCount++;
+        sampleIdx = (sampleIdx + 1) % SAMPLE_MAX;
+        if (sampleCount < SAMPLE_MAX) sampleCount++;
 
         if (graceTicks > 0) {
             graceTicks--;
@@ -105,23 +121,47 @@ public final class GuardController {
         checkFps(mc);
     }
 
+    /** Oyun sürecinin CPU yükü (%), okunamazsa -1. */
+    private static int readCpu() {
+        try {
+            java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+            if (bean instanceof com.sun.management.OperatingSystemMXBean sun) {
+                double d = sun.getProcessCpuLoad();
+                return d < 0 ? -1 : (int) Math.round(d * 100.0);
+            }
+        } catch (Throwable ignored) {
+            // CPU ölçümü yoksa sadece FPS/RAM ile devam et
+        }
+        return -1;
+    }
+
+    private boolean cpuHigh() {
+        return FpsGuardConfig.CPU_AWARE.get() && cpuPct >= FpsGuardConfig.CPU_THRESHOLD.get();
+    }
+
     // ------------------------------------------------------------ FPS mantığı
 
     private void checkFps(Minecraft mc) {
-        if (sampleCount < WINDOW) return;
+        int win = FpsGuardConfig.SAMPLE_SECONDS.get();
+        if (sampleCount < win) return;
         long sum = 0;
-        for (int s : samples) sum += s;
-        double avg = sum / (double) WINDOW;
+        for (int k = 1; k <= win; k++) {
+            sum += samples[(sampleIdx - k + SAMPLE_MAX * 2) % SAMPLE_MAX];
+        }
+        double avg = sum / (double) win;
 
         int target = FpsGuardConfig.TARGET_FPS.get();
         long now = System.currentTimeMillis();
+        int max = maxLevel();
 
-        if (avg < target - 3 && level < maxLevel() && now - lastLevelChange >= 4000) {
-            setLevel(mc, level + 1, now);
+        if (avg < target - 3 && level < max && now - lastLevelChange >= FpsGuardConfig.reduceCooldownMs()) {
+            int step = cpuHigh() ? 2 : 1;
+            setLevel(mc, Math.min(max, level + step), now);
         } else if (avg > target + FpsGuardConfig.RESTORE_HEADROOM.get()
                 && level > 0
-                && ramPct < FpsGuardConfig.RAM_THRESHOLD.get() - 10
-                && now - lastLevelChange >= 20000) {
+                && !cpuHigh()
+                && ramPct < FpsGuardConfig.ramThreshold() - 10
+                && now - lastLevelChange >= FpsGuardConfig.restoreCooldownMs()) {
             setLevel(mc, level - 1, now);
         }
     }
@@ -133,7 +173,7 @@ public final class GuardController {
         long used = rt.totalMemory() - rt.freeMemory();
         ramPct = (int) Math.round(used * 100.0 / rt.maxMemory());
 
-        if (ramPct >= FpsGuardConfig.RAM_THRESHOLD.get()) {
+        if (ramPct >= FpsGuardConfig.ramThreshold()) {
             ramHighSeconds++;
         } else {
             ramHighSeconds = 0;
@@ -141,8 +181,8 @@ public final class GuardController {
         if (ramHighSeconds < 3) return;
 
         long now = System.currentTimeMillis();
-        if (FpsGuardConfig.RAM_CLEANUP.get() && now - lastGc > 60_000) {
-            // Çöp toplama iste (dakikada en fazla 1 kez)
+        if (FpsGuardConfig.RAM_CLEANUP.get() && now - lastGc > FpsGuardConfig.GC_COOLDOWN.get() * 1000L) {
+            // Çöp toplama iste (ayarlanabilir aralıkla)
             System.gc();
             lastGc = now;
             ramHighSeconds = 0;
@@ -155,10 +195,11 @@ public final class GuardController {
     // ------------------------------------------------------- Ayar uygulama
 
     private int maxLevel() {
-        int r = Math.max(0, baseRender - FpsGuardConfig.MIN_RENDER.get());
-        int s = Math.max(0, baseSim - FpsGuardConfig.MIN_SIM.get());
-        double minE = Math.max(0.5, FpsGuardConfig.MIN_ENTITY.get());
-        int e = (int) Math.max(0, Math.ceil((baseEntity - minE) / ENTITY_STEP));
+        int r = FpsGuardConfig.ADJUST_RENDER.get() ? Math.max(0, baseRender - FpsGuardConfig.minRender()) : 0;
+        int s = FpsGuardConfig.ADJUST_SIM.get() ? Math.max(0, baseSim - FpsGuardConfig.minSim()) : 0;
+        double minE = Math.max(0.5, FpsGuardConfig.minEntity());
+        int e = FpsGuardConfig.ADJUST_ENTITY.get()
+                ? (int) Math.max(0, Math.ceil((baseEntity - minE) / ENTITY_STEP)) : 0;
         return Math.max(r, Math.max(s, e));
     }
 
@@ -169,11 +210,21 @@ public final class GuardController {
     }
 
     private void applyLevel(Options o) {
-        int r = Math.max(Math.min(FpsGuardConfig.MIN_RENDER.get(), baseRender), baseRender - level);
-        int s = Math.max(Math.min(FpsGuardConfig.MIN_SIM.get(), baseSim), baseSim - level);
-        double minE = Math.min(Math.max(0.5, FpsGuardConfig.MIN_ENTITY.get()), baseEntity);
-        double e = Math.max(minE, baseEntity - level * ENTITY_STEP);
-        e = Math.round(e * 4.0) / 4.0;
+        int r = baseRender;
+        int s = baseSim;
+        double e = baseEntity;
+
+        if (FpsGuardConfig.ADJUST_RENDER.get()) {
+            r = Math.max(Math.min(FpsGuardConfig.minRender(), baseRender), baseRender - level);
+        }
+        if (FpsGuardConfig.ADJUST_SIM.get()) {
+            s = Math.max(Math.min(FpsGuardConfig.minSim(), baseSim), baseSim - level);
+        }
+        if (FpsGuardConfig.ADJUST_ENTITY.get()) {
+            double minE = Math.min(Math.max(0.5, FpsGuardConfig.minEntity()), baseEntity);
+            e = Math.max(minE, baseEntity - level * ENTITY_STEP);
+            e = Math.round(e * 4.0) / 4.0;
+        }
 
         if (o.renderDistance().get() != r) o.renderDistance().set(r);
         if (o.simulationDistance().get() != s) o.simulationDistance().set(s);
@@ -270,26 +321,65 @@ public final class GuardController {
         Minecraft mc = Minecraft.getInstance();
         if (!isHudOn() || mc.options.hideGui || mc.level == null) return;
 
-        Runtime rt = Runtime.getRuntime();
-        long used = rt.totalMemory() - rt.freeMemory();
-        long max = rt.maxMemory();
-        int pct = (int) Math.round(used * 100.0 / max);
-
+        List<String> lines = new ArrayList<>();
         int fps = mc.getFps();
         int target = FpsGuardConfig.TARGET_FPS.get();
-        int color = fps >= target - 3 ? 0x55FF55 : (fps >= target * 0.7 ? 0xFFFF55 : 0xFF5555);
+        int fpsColor = fps >= target - 3 ? 0x55FF55 : (fps >= target * 0.7 ? 0xFFFF55 : 0xFF5555);
 
-        String text = String.format("FPS %d | RAM %.1f/%.1f GB (%d%%) | Guard %s",
-                fps, used / 1073741824.0, max / 1073741824.0, pct,
-                isGuardOn() ? ("L" + level) : "OFF");
+        boolean showFps = FpsGuardConfig.HUD_FPS.get();
+        if (showFps) {
+            lines.add("FPS " + fps);
+        }
+        if (FpsGuardConfig.HUD_RAM.get()) {
+            Runtime rt = Runtime.getRuntime();
+            long used = rt.totalMemory() - rt.freeMemory();
+            long max = rt.maxMemory();
+            lines.add(String.format("RAM %.1f/%.1f GB (%d%%)",
+                    used / 1073741824.0, max / 1073741824.0, Math.round(used * 100.0 / max)));
+        }
+        if (FpsGuardConfig.HUD_CPU.get() && cpuPct >= 0) {
+            lines.add("CPU " + cpuPct + "%");
+        }
+        if (FpsGuardConfig.HUD_GUARD.get()) {
+            Options o = mc.options;
+            lines.add(isGuardOn()
+                    ? String.format("Guard L%d %s | R%d S%d E%.2f", level,
+                            FpsGuardConfig.PROFILE.get().name(),
+                            o.renderDistance().get(), o.simulationDistance().get(),
+                            o.entityDistanceScaling().get())
+                    : "Guard OFF");
+        }
+        if (lines.isEmpty()) return;
+
+        float s = FpsGuardConfig.HUD_SCALE.get().floatValue();
+        int lineH = 10;
+        int maxW = 0;
+        for (String l : lines) maxW = Math.max(maxW, mc.font.width(l));
+        float totalW = maxW * s;
+        float totalH = lines.size() * lineH * s;
+        int sw = mc.getWindow().getGuiScaledWidth();
+        int sh = mc.getWindow().getGuiScaledHeight();
+
+        Corner corner = FpsGuardConfig.HUD_CORNER.get();
+        boolean right = corner == Corner.TOP_RIGHT || corner == Corner.BOTTOM_RIGHT;
+        boolean bottom = corner == Corner.BOTTOM_LEFT || corner == Corner.BOTTOM_RIGHT;
+        float x = right ? sw - 4 - totalW : 4;
+        float y = bottom ? sh - 4 - totalH : 4;
 
         GuiGraphics g = event.getGuiGraphics();
-        g.drawString(mc.font, text, 4, 4, color, true);
+        g.pose().pushPose();
+        g.pose().translate(x, y, 0f);
+        g.pose().scale(s, s, 1f);
+        for (int i = 0; i < lines.size(); i++) {
+            int color = (showFps && i == 0) ? fpsColor : 0xFFFFFF;
+            g.drawString(mc.font, lines.get(i), 0, i * lineH, color, true);
+        }
+        g.pose().popPose();
     }
 
-    private static void msg(Minecraft mc, String key) {
+    private static void msg(Minecraft mc, Component c) {
         if (mc.player != null) {
-            mc.player.displayClientMessage(Component.translatable(key), true);
+            mc.player.displayClientMessage(c, true);
         }
     }
 }
