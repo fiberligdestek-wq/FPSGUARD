@@ -142,8 +142,7 @@ public final class GuardController {
 
         long now = System.currentTimeMillis();
         if (FpsGuardConfig.RAM_CLEANUP.get() && now - lastGc > 60_000) {
-            // 1) Parçacıkları temizle, 2) çöp toplama iste (dakikada en fazla 1 kez)
-            mc.particleEngine.clearParticles();
+            // Çöp toplama iste (dakikada en fazla 1 kez)
             System.gc();
             lastGc = now;
             ramHighSeconds = 0;
@@ -269,7 +268,7 @@ public final class GuardController {
     @SubscribeEvent
     public void onRenderGui(RenderGuiEvent.Post event) {
         Minecraft mc = Minecraft.getInstance();
-        if (!isHudOn() || mc.options.hideGui || mc.options.renderDebug || mc.level == null) return;
+        if (!isHudOn() || mc.options.hideGui || mc.level == null) return;
 
         Runtime rt = Runtime.getRuntime();
         long used = rt.totalMemory() - rt.freeMemory();
