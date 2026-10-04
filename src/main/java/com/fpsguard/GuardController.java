@@ -3,8 +3,6 @@ package com.fpsguard;
 import com.fpsguard.FpsGuardConfig.Corner;
 import com.fpsguard.FpsGuardConfig.Profile;
 import java.lang.management.ManagementFactory;
-import java.util.ArrayList;
-import java.util.List;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
@@ -18,6 +16,13 @@ import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.event.GameShuttingDownEvent;
 import org.lwjgl.glfw.GLFW;
 
+/**
+ * Oyun odaktayken çalışan Guard: FPS / RAM / CPU durumuna göre mesafeleri kademeli kısar ve geri açar.
+ * Uyku modu (arka plan) SleepMode sınıfındadır; bu sınıf onunla odak kaybında el değiştirir.
+ *
+ * Ağır işler saniyede bir (20 tick) yapılır. Her tick yalnızca tuş kontrolü ve bir boolean karşılaştırması vardır.
+ * Gösterge metinleri saniyede bir hazırlanır; kare başına string üretilmez.
+ */
 public final class GuardController {
     static final KeyMapping KEY_HUD = new KeyMapping("key.fpsguard.hud", GLFW.GLFW_KEY_F8, "key.categories.fpsguard");
     static final KeyMapping KEY_GUARD = new KeyMapping("key.fpsguard.toggle", GLFW.GLFW_KEY_F9, "key.categories.fpsguard");
@@ -26,15 +31,17 @@ public final class GuardController {
     private static final int SAMPLE_MAX = 10;
     private static final double ENTITY_STEP = 0.25;
 
+    private final SleepMode sleep;
+
     private final int[] samples = new int[SAMPLE_MAX];
     private int sampleCount;
     private int sampleIdx;
+    private int lowStreak;
 
     private int tickCounter;
     private int graceTicks;
-
-    private Boolean hudOn;      // null = config'ten oku
-    private Boolean guardOn;    // null = config'ten oku
+    private boolean wasGuardOn = true;
+    private boolean localServer;
 
     // Kullanıcının kendi ayarları (taban değerler)
     private boolean baseKnown;
@@ -51,9 +58,21 @@ public final class GuardController {
     private long lastGc;
     private int ramHighSeconds;
     private int ramPct;
+
+    private com.sun.management.OperatingSystemMXBean cpuBean;
+    private boolean cpuInit;
     private int cpuPct = -1;
 
-    private Integer savedFrameLimit;
+    // Gösterge önbelleği (saniyede bir yenilenir)
+    private final String[] hudLines = new String[4];
+    private int hudCount;
+    private int hudWidth;
+    private int hudFpsColor = 0xFFFFFF;
+    private boolean hudFirstIsFps;
+
+    GuardController(SleepMode sleep) {
+        this.sleep = sleep;
+    }
 
     public static void registerKeys(RegisterKeyMappingsEvent e) {
         e.register(KEY_HUD);
@@ -61,14 +80,9 @@ public final class GuardController {
         e.register(KEY_PROFILE);
     }
 
-    private boolean isGuardOn() {
-        if (guardOn == null) guardOn = FpsGuardConfig.ENABLED.get();
-        return guardOn;
-    }
-
-    private boolean isHudOn() {
-        if (hudOn == null) hudOn = FpsGuardConfig.SHOW_HUD.get();
-        return hudOn;
+    /** Guard şu an mesafeleri kısmış durumda mı? (RenderCulling kullanır) */
+    boolean isReducing() {
+        return level > 0;
     }
 
     // ------------------------------------------------------------------ tick
@@ -76,17 +90,85 @@ public final class GuardController {
     @SubscribeEvent
     public void onClientTick(ClientTickEvent.Post event) {
         Minecraft mc = Minecraft.getInstance();
+        if (mc.options == null) {
+            return;
+        }
 
+        handleKeys(mc);
+        sleep.update(mc, mc.isWindowActive(), this);
+
+        if (++tickCounter < 20) {
+            return;
+        }
+        tickCounter = 0;
+        onSecond(mc);
+    }
+
+    private void onSecond(Minecraft mc) {
+        boolean on = FpsGuardConfig.ENABLED.get();
+        if (!on && wasGuardOn) {
+            restoreAll(mc);
+        }
+        wasGuardOn = on;
+
+        cpuPct = readCpu();
+
+        boolean inWorld = mc.level != null && mc.player != null;
+        if (inWorld) {
+            localServer = mc.hasSingleplayerServer();
+            refreshHud(mc, on);
+        } else {
+            hudCount = 0;
+        }
+        if (!on || !inWorld) {
+            return;
+        }
+
+        // Uykudayken ya da pencere odakta değilken FPS düşük görünür; örnek alma, karar verme
+        if (!mc.isWindowActive() || sleep.isSleeping()) {
+            return;
+        }
+
+        samples[sampleIdx] = mc.getFps();
+        sampleIdx = (sampleIdx + 1) % SAMPLE_MAX;
+        if (sampleCount < SAMPLE_MAX) {
+            sampleCount++;
+        }
+
+        if (graceTicks > 0) {
+            graceTicks--;
+            return;
+        }
+        // Menü açıkken ya da oyun durmuşken karar verme
+        if (mc.screen != null || mc.isPaused()) {
+            return;
+        }
+
+        syncBaseline(mc.options);
+        checkRam(mc);
+        checkFps(mc);
+    }
+
+    // ------------------------------------------------------------ tuşlar
+
+    private void handleKeys(Minecraft mc) {
         while (KEY_HUD.consumeClick()) {
-            hudOn = !isHudOn();
-            msg(mc, Component.translatable(hudOn ? "fpsguard.msg.hud_on" : "fpsguard.msg.hud_off"));
+            boolean on = !FpsGuardConfig.SHOW_HUD.get();
+            FpsGuardConfig.SHOW_HUD.set(on);
+            FpsGuardConfig.SHOW_HUD.save();
+            tickCounter = 19;   // göstergeyi hemen yenile
+            msg(mc, Component.translatable(on ? "fpsguard.msg.hud_on" : "fpsguard.msg.hud_off"));
         }
         while (KEY_GUARD.consumeClick()) {
-            guardOn = !isGuardOn();
-            if (!guardOn) {
+            boolean on = !FpsGuardConfig.ENABLED.get();
+            FpsGuardConfig.ENABLED.set(on);
+            FpsGuardConfig.ENABLED.save();
+            wasGuardOn = on;
+            if (!on) {
                 restoreAll(mc);
             }
-            msg(mc, Component.translatable(guardOn ? "fpsguard.msg.guard_on" : "fpsguard.msg.guard_off"));
+            tickCounter = 19;
+            msg(mc, Component.translatable(on ? "fpsguard.msg.guard_on" : "fpsguard.msg.guard_off"));
         }
         while (KEY_PROFILE.consumeClick()) {
             Profile[] all = Profile.values();
@@ -95,44 +177,26 @@ public final class GuardController {
             FpsGuardConfig.PROFILE.save();
             msg(mc, Component.translatable("fpsguard.msg.profile", next.name()));
         }
-
-        handleBackground(mc);
-
-        if (++tickCounter < 20) return;
-        tickCounter = 0;
-
-        if (!isGuardOn() || mc.level == null || mc.player == null) return;
-
-        // Saniyede bir örnek al
-        cpuPct = readCpu();
-        samples[sampleIdx] = mc.getFps();
-        sampleIdx = (sampleIdx + 1) % SAMPLE_MAX;
-        if (sampleCount < SAMPLE_MAX) sampleCount++;
-
-        if (graceTicks > 0) {
-            graceTicks--;
-            return;
-        }
-        // Menü açıkken, oyun durmuşken ya da pencere arka plandayken karar verme
-        if (mc.screen != null || mc.isPaused() || !mc.isWindowActive()) return;
-
-        syncBaseline(mc.options);
-        checkRam(mc);
-        checkFps(mc);
     }
 
-    /** Oyun sürecinin CPU yükü (%), okunamazsa -1. */
-    private static int readCpu() {
-        try {
+    // ------------------------------------------------------------ CPU
+
+    /** Oyun sürecinin CPU yükü (%), JVM desteklemiyorsa -1. */
+    private int readCpu() {
+        if (!cpuInit) {
+            cpuInit = true;
             java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
             if (bean instanceof com.sun.management.OperatingSystemMXBean sun) {
-                double d = sun.getProcessCpuLoad();
-                return d < 0 ? -1 : (int) Math.round(d * 100.0);
+                cpuBean = sun;
+            } else {
+                FpsGuard.LOGGER.warn("[FpsGuard] CPU load is not available on this JVM; CPU features are disabled");
             }
-        } catch (Throwable ignored) {
-            // CPU ölçümü yoksa sadece FPS/RAM ile devam et
         }
-        return -1;
+        if (cpuBean == null) {
+            return -1;
+        }
+        double d = cpuBean.getProcessCpuLoad();
+        return d < 0 ? -1 : (int) Math.round(d * 100.0);
     }
 
     private boolean cpuHigh() {
@@ -142,21 +206,36 @@ public final class GuardController {
     // ------------------------------------------------------------ FPS mantığı
 
     private void checkFps(Minecraft mc) {
+        long now = System.currentTimeMillis();
+        int target = FpsGuardConfig.TARGET_FPS.get();
+        int max = maxLevel();
+        int last = samples[(sampleIdx - 1 + SAMPLE_MAX) % SAMPLE_MAX];
+
+        // Ani düşüş (savaş / kalabalık / yoğun chunk yükü): üst üste 2 sn çok düşükse 2-3 kademe birden kıs
+        int emergencyBelow = target * FpsGuardConfig.emergencyPercent() / 100;
+        if (last < emergencyBelow) {
+            lowStreak++;
+        } else {
+            lowStreak = 0;
+        }
+        if (sampleCount >= 2 && lowStreak >= 2 && level < max && now - lastLevelChange >= 2000) {
+            lowStreak = 0;
+            setLevel(mc, Math.min(max, level + (cpuHigh() ? 3 : 2)), now);
+            return;
+        }
+
         int win = FpsGuardConfig.SAMPLE_SECONDS.get();
-        if (sampleCount < win) return;
+        if (sampleCount < win) {
+            return;
+        }
         long sum = 0;
         for (int k = 1; k <= win; k++) {
             sum += samples[(sampleIdx - k + SAMPLE_MAX * 2) % SAMPLE_MAX];
         }
         double avg = sum / (double) win;
 
-        int target = FpsGuardConfig.TARGET_FPS.get();
-        long now = System.currentTimeMillis();
-        int max = maxLevel();
-
         if (avg < target - 3 && level < max && now - lastLevelChange >= FpsGuardConfig.reduceCooldownMs()) {
-            int step = cpuHigh() ? 2 : 1;
-            setLevel(mc, Math.min(max, level + step), now);
+            setLevel(mc, Math.min(max, level + (cpuHigh() ? 2 : 1)), now);
         } else if (avg > target + FpsGuardConfig.RESTORE_HEADROOM.get()
                 && level > 0
                 && !cpuHigh()
@@ -178,25 +257,37 @@ public final class GuardController {
         } else {
             ramHighSeconds = 0;
         }
-        if (ramHighSeconds < 3) return;
+        if (ramHighSeconds < 3) {
+            return;
+        }
 
         long now = System.currentTimeMillis();
         if (FpsGuardConfig.RAM_CLEANUP.get() && now - lastGc > FpsGuardConfig.GC_COOLDOWN.get() * 1000L) {
-            // Çöp toplama iste (ayarlanabilir aralıkla)
+            // Çöp toplama iste (aralık ayarlı). JVM garanti etmez.
             System.gc();
             lastGc = now;
             ramHighSeconds = 0;
         } else if (now - lastLevelChange >= 5000 && level < maxLevel()) {
-            // GC'den sonra bile RAM yüksekse gerçekten fazla chunk tutuluyor demektir -> mesafeyi kıs
+            // GC'den sonra bile heap yüksekse gerçekten fazla chunk tutuluyor demektir -> mesafeyi kıs
             setLevel(mc, level + 1, now);
         }
     }
 
     // ------------------------------------------------------- Ayar uygulama
 
+    private boolean adjustRenderNow() {
+        return FpsGuardConfig.ADJUST_RENDER.get()
+                && (localServer || FpsGuardConfig.ADJUST_RENDER_ON_SERVERS.get());
+    }
+
+    /** Sunucuda client'ın simulation değeri kullanılmaz, o yüzden yalnızca tek oyunculuda. */
+    private boolean adjustSimNow() {
+        return FpsGuardConfig.ADJUST_SIM.get() && localServer;
+    }
+
     private int maxLevel() {
-        int r = FpsGuardConfig.ADJUST_RENDER.get() ? Math.max(0, baseRender - FpsGuardConfig.minRender()) : 0;
-        int s = FpsGuardConfig.ADJUST_SIM.get() ? Math.max(0, baseSim - FpsGuardConfig.minSim()) : 0;
+        int r = adjustRenderNow() ? Math.max(0, baseRender - FpsGuardConfig.minRender()) : 0;
+        int s = adjustSimNow() ? Math.max(0, baseSim - FpsGuardConfig.minSim()) : 0;
         double minE = Math.max(0.5, FpsGuardConfig.minEntity());
         int e = FpsGuardConfig.ADJUST_ENTITY.get()
                 ? (int) Math.max(0, Math.ceil((baseEntity - minE) / ENTITY_STEP)) : 0;
@@ -204,9 +295,14 @@ public final class GuardController {
     }
 
     private void setLevel(Minecraft mc, int newLevel, long now) {
+        int old = level;
         level = Math.max(0, newLevel);
         lastLevelChange = now;
         applyLevel(mc.options);
+        if (FpsGuardConfig.DEBUG.get()) {
+            FpsGuard.LOGGER.info("[FpsGuard] Level {} -> {} (render={}, sim={}, entity={})",
+                    old, level, lastRender, lastSim, lastEntity);
+        }
     }
 
     private void applyLevel(Options o) {
@@ -214,10 +310,10 @@ public final class GuardController {
         int s = baseSim;
         double e = baseEntity;
 
-        if (FpsGuardConfig.ADJUST_RENDER.get()) {
+        if (adjustRenderNow()) {
             r = Math.max(Math.min(FpsGuardConfig.minRender(), baseRender), baseRender - level);
         }
-        if (FpsGuardConfig.ADJUST_SIM.get()) {
+        if (adjustSimNow()) {
             s = Math.max(Math.min(FpsGuardConfig.minSim(), baseSim), baseSim - level);
         }
         if (FpsGuardConfig.ADJUST_ENTITY.get()) {
@@ -259,37 +355,28 @@ public final class GuardController {
             applyLevel(mc.options);
         }
         baseKnown = false;
+        resetSamples();
+    }
+
+    private void resetSamples() {
         sampleCount = 0;
         sampleIdx = 0;
+        lowStreak = 0;
         ramHighSeconds = 0;
-        restoreFrameLimit(mc);
     }
 
-    // ------------------------------------------------ Arka plan FPS kısıtı
+    // ------------------------------------------------ Uyku moduyla el değiştirme
 
-    private void handleBackground(Minecraft mc) {
-        if (!FpsGuardConfig.BACKGROUND_THROTTLE.get() || !isGuardOn()) {
-            if (savedFrameLimit != null) restoreFrameLimit(mc);
-            return;
-        }
-        boolean active = mc.isWindowActive();
-        if (!active && savedFrameLimit == null) {
-            int cur = mc.options.framerateLimit().get();
-            int bg = Math.max(10, (FpsGuardConfig.BACKGROUND_FPS.get() / 10) * 10);
-            if (cur > bg) {
-                savedFrameLimit = cur;
-                mc.options.framerateLimit().set(bg);
-            }
-        } else if (active && savedFrameLimit != null) {
-            restoreFrameLimit(mc);
-        }
+    /** Uykuya geçmeden önce: Guard kendi kıstıklarını geri açar, taban değerler uykunun anlık görüntüsüne girer. */
+    void beforeSleep(Minecraft mc) {
+        restoreAll(mc);
     }
 
-    private void restoreFrameLimit(Minecraft mc) {
-        if (savedFrameLimit != null) {
-            mc.options.framerateLimit().set(savedFrameLimit);
-            savedFrameLimit = null;
-        }
+    /** Uykudan çıkınca: taban değerler yeniden okunur, FPS örnekleri sıfırdan toplanır. */
+    void afterWake() {
+        baseKnown = false;
+        resetSamples();
+        graceTicks = Math.max(graceTicks, 3);
     }
 
     // ------------------------------------------------------------ Olaylar
@@ -298,65 +385,84 @@ public final class GuardController {
     public void onLoggingIn(ClientPlayerNetworkEvent.LoggingIn e) {
         baseKnown = false;
         level = 0;
-        sampleCount = 0;
-        sampleIdx = 0;
-        ramHighSeconds = 0;
+        resetSamples();
         graceTicks = FpsGuardConfig.GRACE_SECONDS.get();
     }
 
     @SubscribeEvent
     public void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut e) {
-        restoreAll(Minecraft.getInstance());
+        Minecraft mc = Minecraft.getInstance();
+        sleep.forceWake(mc, this);
+        restoreAll(mc);
+        hudCount = 0;
     }
 
     @SubscribeEvent
     public void onShutdown(GameShuttingDownEvent e) {
-        restoreAll(Minecraft.getInstance());
+        Minecraft mc = Minecraft.getInstance();
+        sleep.forceWake(mc, this);
+        restoreAll(mc);
     }
 
     // ---------------------------------------------------------------- HUD
 
-    @SubscribeEvent
-    public void onRenderGui(RenderGuiEvent.Post event) {
-        Minecraft mc = Minecraft.getInstance();
-        if (!isHudOn() || mc.options.hideGui || mc.level == null) return;
+    /** Saniyede bir çağrılır: gösterge metinlerini hazırlar. Kare başına allocation yoktur. */
+    private void refreshHud(Minecraft mc, boolean guardOn) {
+        hudCount = 0;
+        hudFirstIsFps = false;
+        if (!FpsGuardConfig.SHOW_HUD.get()) {
+            return;
+        }
 
-        List<String> lines = new ArrayList<>();
         int fps = mc.getFps();
         int target = FpsGuardConfig.TARGET_FPS.get();
-        int fpsColor = fps >= target - 3 ? 0x55FF55 : (fps >= target * 0.7 ? 0xFFFF55 : 0xFF5555);
+        hudFpsColor = fps >= target - 3 ? 0x55FF55 : (fps >= target * 0.7 ? 0xFFFF55 : 0xFF5555);
 
-        boolean showFps = FpsGuardConfig.HUD_FPS.get();
-        if (showFps) {
-            lines.add("FPS " + fps);
+        if (FpsGuardConfig.HUD_FPS.get()) {
+            hudLines[hudCount++] = "FPS " + fps;
+            hudFirstIsFps = true;
         }
         if (FpsGuardConfig.HUD_RAM.get()) {
             Runtime rt = Runtime.getRuntime();
             long used = rt.totalMemory() - rt.freeMemory();
             long max = rt.maxMemory();
-            lines.add(String.format("RAM %.1f/%.1f GB (%d%%)",
-                    used / 1073741824.0, max / 1073741824.0, Math.round(used * 100.0 / max)));
+            hudLines[hudCount++] = String.format("RAM %.1f/%.1f GB (%d%%)",
+                    used / 1073741824.0, max / 1073741824.0, Math.round(used * 100.0 / max));
         }
         if (FpsGuardConfig.HUD_CPU.get() && cpuPct >= 0) {
-            lines.add("CPU " + cpuPct + "%");
+            hudLines[hudCount++] = "CPU " + cpuPct + "%";
         }
         if (FpsGuardConfig.HUD_GUARD.get()) {
             Options o = mc.options;
-            lines.add(isGuardOn()
+            hudLines[hudCount++] = guardOn
                     ? String.format("Guard L%d %s | R%d S%d E%.2f", level,
                             FpsGuardConfig.PROFILE.get().name(),
                             o.renderDistance().get(), o.simulationDistance().get(),
                             o.entityDistanceScaling().get())
-                    : "Guard OFF");
+                    : "Guard OFF";
         }
-        if (lines.isEmpty()) return;
+
+        int w = 0;
+        for (int i = 0; i < hudCount; i++) {
+            w = Math.max(w, mc.font.width(hudLines[i]));
+        }
+        hudWidth = w;
+    }
+
+    @SubscribeEvent
+    public void onRenderGui(RenderGuiEvent.Post event) {
+        if (hudCount == 0) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.options.hideGui || mc.level == null) {
+            return;
+        }
 
         float s = FpsGuardConfig.HUD_SCALE.get().floatValue();
         int lineH = 10;
-        int maxW = 0;
-        for (String l : lines) maxW = Math.max(maxW, mc.font.width(l));
-        float totalW = maxW * s;
-        float totalH = lines.size() * lineH * s;
+        float totalW = hudWidth * s;
+        float totalH = hudCount * lineH * s;
         int sw = mc.getWindow().getGuiScaledWidth();
         int sh = mc.getWindow().getGuiScaledHeight();
 
@@ -370,9 +476,9 @@ public final class GuardController {
         g.pose().pushPose();
         g.pose().translate(x, y, 0f);
         g.pose().scale(s, s, 1f);
-        for (int i = 0; i < lines.size(); i++) {
-            int color = (showFps && i == 0) ? fpsColor : 0xFFFFFF;
-            g.drawString(mc.font, lines.get(i), 0, i * lineH, color, true);
+        for (int i = 0; i < hudCount; i++) {
+            int color = (hudFirstIsFps && i == 0) ? hudFpsColor : 0xFFFFFF;
+            g.drawString(mc.font, hudLines[i], 0, i * lineH, color, true);
         }
         g.pose().popPose();
     }

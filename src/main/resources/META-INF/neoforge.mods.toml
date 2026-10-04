@@ -4,12 +4,13 @@ license = "MIT"
 
 [[mods]]
 modId = "fpsguard"
-version = "1.1.0"
+version = "1.2.0"
 displayName = "FPS Guard"
 authors = "Emir"
 description = '''
-FPS ve RAM koruyucu. FPS hedefin altına düşünce uzak entity ve render mesafesini kademeli kısar,
-FPS düzelince geri açar. RAM dolunca güvenli şekilde bellek temizler. Pencere arka plandayken FPS'i düşürür.
+Client-side performance helper. While focused: lowers render/simulation/entity distance when FPS, RAM or CPU is under pressure and restores them later.
+While the window is in the background: sleep mode (low FPS cap, optional lower render distance, mute, minimal particles, skipped entity rendering, one GC request).
+Everything is configurable in-game and original settings are always restored.
 '''
 
 [[dependencies.fpsguard]]
